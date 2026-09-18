@@ -9,7 +9,8 @@ your intro in front and your outro behind.
 WHAT IT DOES, IN ORDER
   1. Trim    cut everything before your start point and after your end point
   2. Cut     take out the patches you marked in the middle — retakes, false
-             starts, the phone going off — and rejoin what's left
+             starts, the phone going off — plus, if you ask for them, dead air
+             over two seconds and repeated words, then rejoin what's left
   3. Level   normalise the speech to -16 LUFS (optional, on by default)
   4. Join    intro, then the episode, then outro
   5. Encode  MP3 at 128kbps
@@ -197,6 +198,114 @@ def check_path():
     return p if os.path.isfile(p) else None
 
 
+# ------------------------------------------------------ pauses & stutters
+SILENCE = {
+    "threshold_db": -38.0,   # quieter than this counts as silence
+    "min_seconds": 2.0,      # shorter gaps are thinking, not dead air
+    "keep_seconds": 0.45,    # how much of each gap survives, so it breathes
+}
+
+# Doubling these is how people talk, not a stumble. "No, no, no" is emphasis
+# and "very, very good" is a real sentence; cutting them makes the speaker
+# sound clipped and odd.
+DELIBERATE_REPEATS = {"no", "yes", "yeah", "yep", "very", "ha", "haha", "bye",
+                      "hey", "hi", "ok", "okay", "right", "sure", "please",
+                      "come", "go", "run", "now", "more", "again", "had", "really",
+                      "that", "what"}
+
+
+def find_silences(path, threshold_db=None, min_seconds=None):
+    """Where nobody is speaking, read straight off the waveform.
+
+    Deliberately not read from gaps in a transcript: a long "uhhh" leaves a
+    gap in the words and is nowhere near silent, and cutting it would take out
+    the sound of someone thinking mid-sentence.
+    """
+    if not have_ffmpeg():
+        return []
+    th = SILENCE["threshold_db"] if threshold_db is None else threshold_db
+    mn = SILENCE["min_seconds"] if min_seconds is None else min_seconds
+    p = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", path,
+         "-af", "silencedetect=noise=%sdB:d=%s" % (th, mn), "-f", "null", "-"],
+        capture_output=True, text=True)
+    spans, start = [], None
+    for line in p.stderr.splitlines():
+        m = re.search(r"silence_start:\s*(-?[\d.]+)", line)
+        if m:
+            start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*(-?[\d.]+)", line)
+        if m and start is not None:
+            spans.append((max(0.0, start), float(m.group(1))))
+            start = None
+    # Leave a breath at each end rather than butting the speech together.
+    keep = SILENCE["keep_seconds"]
+    out = []
+    for a, b in spans:
+        a2, b2 = a + keep / 2.0, b - keep / 2.0
+        if b2 - a2 > 0.25:
+            out.append((a2, b2, "dead air"))
+    return out
+
+
+def load_word_times(path):
+    """Words with a start and end time, from a Rev.ai JSON.
+
+    This is the only format here that carries per-word timings, and without
+    them a stutter cannot be cut — you can hear "I, I, I think" perfectly well
+    in the audio, but you cannot say where the second "I" ends without
+    something that already worked it out.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    out = []
+    for mono in (data.get("monologues") or []):
+        for el in (mono.get("elements") or []):
+            if el.get("type") != "text":
+                continue
+            ts, end = el.get("ts"), el.get("end_ts")
+            if ts is None or end is None:
+                continue
+            w = re.sub(r"[^\w']", "", str(el.get("value") or "")).lower()
+            if w:
+                out.append({"w": w, "ts": float(ts), "end": float(end)})
+    return out
+
+
+def find_stutters(words, max_gap=0.8):
+    """Immediately repeated words: "I, I, I think" becomes "I think".
+
+    The LAST repeat is the one kept. It's the one that carries on into the
+    rest of the sentence, so cutting the earlier attempts leaves the audio
+    running straight from the stumble into the finished thought.
+
+    Three guards, each of which stops a cut that would sound wrong:
+
+      - only truly adjacent repeats, with no other word between them
+      - only when they're close in time, because the same word ending one
+        sentence and starting the next is not a stutter
+      - never words people double on purpose — "no, no, no" is emphasis
+    """
+    cuts, i, n = [], 0, len(words)
+    while i < n - 1:
+        w = words[i]["w"]
+        j = i
+        while (j + 1 < n and words[j + 1]["w"] == w
+               and words[j + 1]["ts"] - words[j]["end"] <= max_gap):
+            j += 1
+        if j > i and w not in DELIBERATE_REPEATS and len(w) <= 12:
+            # From the first attempt up to the start of the keeper.
+            a, b = words[i]["ts"], words[j]["ts"]
+            if b - a > 0.05:
+                cuts.append((a, b, "stutter: %s" % (("%s " % w) * (j - i + 1)).strip()))
+        i = j + 1
+    return cuts
+
+
 # ---------------------------------------------------------- retake finder
 # What people actually say when a take goes wrong. Taken from real sessions,
 # not imagined: "Oh, shoot, I'm sorry... can you repeat that? Let's redo this"
@@ -368,6 +477,80 @@ def fade_piece(src, dst, label):
             % (FADE, max(0.0, d - FADE), FADE), dst], label)
 
 
+# How many pieces go into one ffmpeg call. Each piece is roughly 120
+# characters of filter graph, so 120 of them is about 15,000 — comfortably
+# inside the ~32,000 character limit a command can have on Windows, with room
+# to spare for a long file path.
+#
+# An earlier version passed the graph in a file instead, with
+# -filter_complex_script. That is tidier and it failed on a real machine:
+# "Unrecognized option 'filter_complex_script'". Chunking needs nothing that
+# every ffmpeg build hasn't had for a decade.
+CHUNK = 120
+
+
+def render_pieces(src, spans, dst):
+    """Cut out these spans, fade each one, join them — one ffmpeg call."""
+    parts, labels = [], []
+    for i, (a, b) in enumerate(spans):
+        d = b - a
+        chain = ["atrim=start=%.4f:end=%.4f" % (a, b), "asetpts=N/SR/TB"]
+        # A piece shorter than two fades has no flat middle to fade into, and
+        # afade would just make the whole thing quieter.
+        if d > 2 * FADE:
+            chain.append("afade=t=in:st=0:d=%s" % FADE)
+            chain.append("afade=t=out:st=%.4f:d=%s" % (d - FADE, FADE))
+        parts.append("[0:a]%s[s%d];" % (",".join(chain), i))
+        labels.append("[s%d]" % i)
+    graph = "".join(parts) + "%sconcat=n=%d:v=0:a=1[out]" % ("".join(labels),
+                                                             len(labels))
+    run_ff(["-i", src, "-filter_complex", graph, "-map", "[out]",
+            "-ac", "2", "-ar", SR, "-c:a", "pcm_s16le", dst], "cutting")
+
+
+def build_body(src, keep, tmp):
+    """Cut the recording down to the pieces we're keeping.
+
+    Extracting each piece as its own file works fine for three or four cuts
+    and falls apart at a hundred: taking out every stutter in a real episode
+    left 128 pieces, which that way meant 256 ffmpeg launches and a build
+    measured in minutes. So the edit goes into a filter graph instead — trim,
+    fade, concatenate — and ffmpeg does the lot in one pass.
+
+    Above CHUNK pieces the graph is split across several calls and the results
+    joined, which keeps any single command well inside the length a command
+    line will accept.
+
+    Returns the joined audio and where each seam lands inside it. Seam
+    positions are summed from the spans rather than measured afterwards, which
+    is both exact and free.
+    """
+    seams, at = [], 0.0
+    for i, (a, b) in enumerate(keep):
+        if i:
+            seams.append(at)
+        at += b - a
+
+    body = os.path.join(tmp, "body.wav")
+    if len(keep) <= CHUNK:
+        render_pieces(src, keep, body)
+        return body, seams
+
+    chunks = [keep[i:i + CHUNK] for i in range(0, len(keep), CHUNK)]
+    files = []
+    for n, spans in enumerate(chunks):
+        out = os.path.join(tmp, "chunk%03d.wav" % n)
+        render_pieces(src, spans, out)
+        files.append(out)
+    listing = os.path.join(tmp, "chunks.txt")
+    with open(listing, "w", encoding="utf-8") as f:
+        for p in files:
+            f.write("file '%s'\n" % p.replace("'", "'\\''"))
+    run_ff(["-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", body],
+           "joining the pieces")
+    return body, seams
+
+
 def measure_loudness(path):
     """First loudnorm pass: measure, so the second pass can be accurate."""
     p = subprocess.run(
@@ -414,7 +597,35 @@ def build():
         for c in bad:
             say("   ! ignoring a cut row that doesn't make sense: %s to %s"
                 % (c.get("from") or "?", c.get("to") or "?"))
-        cuts = merge_spans(cuts)
+        hand = len(cuts)
+
+        # Automatic cuts, added to whatever was marked by hand. Both kinds go
+        # through the same merge, so an automatic cut that lands inside a
+        # manual one doesn't produce a duplicate seam.
+        if st.get("remove_pauses"):
+            found = [s for s in find_silences(src) if start <= s[0] and s[1] <= end]
+            cuts += found
+            say("pauses:     %d over %ss removed, %s in total"
+                % (len(found), SILENCE["min_seconds"],
+                   hms(sum(b - a for a, b, _ in found))))
+
+        if st.get("remove_stutters"):
+            wt = st.get("word_times") or ""
+            words = load_word_times(os.path.join(WORK, wt)) if wt else []
+            if not words:
+                say("stutters:   skipped — needs a transcript with per-word "
+                    "timings (a Rev.ai .json)")
+            else:
+                found = [s for s in find_stutters(words)
+                         if start <= s[0] and s[1] <= end]
+                cuts += found
+                say("stutters:   %d repeated words removed, %s in total"
+                    % (len(found), hms(sum(b - a for a, b, _ in found))))
+
+        cuts = merge_spans(sorted(cuts, key=lambda x: x[0]))
+        if hand and len(cuts) != hand:
+            say("            %d marked by hand, %d in all after merging"
+                % (hand, len(cuts)))
         keep = keep_spans(start, end, cuts)
         if not keep:
             raise RuntimeError("the cuts remove everything between the trim "
@@ -422,46 +633,18 @@ def build():
 
         removed = (end - start) - sum(b - a for a, b in keep)
         if cuts:
-            say("cuts:       %d from the middle, %s in total"
+            say("cuts:       %d in all, %s taken out of the middle"
                 % (len(cuts), hms(removed)))
-            for a, b, why in cuts:
-                say("            %s to %s%s"
-                    % (hms(a), hms(b), ("  (%s)" % why) if why else ""))
+            # The hand-marked ones are worth naming; a hundred stutters are
+            # not, and printing them buries everything else.
+            named = [c for c in cuts if c[2] and not c[2].startswith(("stutter", "dead air"))]
+            for a, b, why in named[:12]:
+                say("            %s to %s  (%s)" % (hms(a), hms(b), why))
 
-        # 1. Pull out each surviving piece and join them. Seeking before -i is
-        # fast; re-encoding to wav is what makes it land on the exact sample
-        # rather than the nearest keyframe.
-        #
-        # Every piece gets its own short fade before it's joined to the next,
-        # because a cut in the middle of a sentence is exactly the place a
-        # butt-join clicks.
-        body_parts = []
-        for i, (a, b) in enumerate(keep):
-            raw_piece = os.path.join(tmp, "keep%02d-raw.wav" % i)
-            run_ff(["-ss", "%.3f" % a, "-t", "%.3f" % (b - a), "-i", src,
-                    "-ac", "2", "-ar", SR, "-c:a", "pcm_s16le", raw_piece],
-                   "cutting piece %d" % (i + 1))
-            piece = os.path.join(tmp, "keep%02d.wav" % i)
-            fade_piece(raw_piece, piece, "fading piece %d" % (i + 1))
-            body_parts.append(piece)
-
-        body = os.path.join(tmp, "body.wav")
-        body_seams = []
-        if len(body_parts) == 1:
-            shutil.copyfile(body_parts[0], body)
-        else:
-            at = 0.0
-            for p in body_parts[:-1]:
-                at += duration(p)
-                body_seams.append(at)
-            listing = os.path.join(tmp, "body.txt")
-            with open(listing, "w", encoding="utf-8") as f:
-                for p in body_parts:
-                    f.write("file '%s'\n" % p.replace("'", "'\\''"))
-            run_ff(["-f", "concat", "-safe", "0", "-i", listing, "-c", "copy",
-                    body], "joining the pieces")
-            say("            rebuilt from %d pieces" % len(body_parts))
-
+        # One ffmpeg pass for the whole edit, however many pieces that is.
+        body, body_seams = build_body(src, keep, tmp)
+        if len(keep) > 1:
+            say("            rebuilt from %d pieces" % len(keep))
         say("            %s removed in all, %s of episode left"
             % (hms(start + (total - end) + removed), hms(duration(body))))
 
@@ -583,8 +766,22 @@ def make_check(final, seams, tmp):
     quality check compressed into about twenty seconds.
     """
     total = duration(final)
+
+    # With automatic cuts there can be a hundred seams, and eight seconds
+    # around each would be a seventeen-minute "check" nobody plays. Keep the
+    # first and last — the music joins, the ones most likely to be wrong —
+    # and spread a sample across the rest.
+    MAX = 10
+    picked = seams
+    if len(seams) > MAX:
+        middle = seams[1:-1]
+        step = len(middle) / float(MAX - 2)
+        picked = ([seams[0]]
+                  + [middle[int(i * step)] for i in range(MAX - 2)]
+                  + [seams[-1]])
+
     spans = []
-    for s in seams:
+    for s in picked:
         spans.append((max(0.0, s - 4.0), min(total, s + 4.0)))
     if not spans:
         spans = [(0.0, min(6.0, total)), (max(0.0, total - 6.0), total)]
@@ -723,6 +920,18 @@ __CUTS__
 
 <h1>__BUILDSTEP__. Build it</h1>
 <div class="card">
+  <label class="chk"><input type="checkbox" id="pauses" __PAUSES__>
+    Cut out dead air over 2 seconds</label>
+  <p class="hint" style="margin:6px 0 14px">Found in the waveform, so it works
+    on any recording. Leaves about half a second at each gap so it still
+    breathes &mdash; two seconds, not one, because cutting every pause makes
+    an interview sound like an advert.</p>
+
+  <label class="chk"><input type="checkbox" id="stutters" __STUTTERS__>
+    Cut out repeated words &mdash; &ldquo;I, I, I think&rdquo; &rarr;
+    &ldquo;I think&rdquo;</label>
+  <p class="hint" style="margin:6px 0 14px">__STUTTERNOTE__</p>
+
   <label class="chk"><input type="checkbox" id="norm" __NORM__>
     Level the speech to &minus;16 LUFS</label>
   <p class="hint">What Apple and Spotify expect. Too quiet and people turn you
@@ -834,9 +1043,12 @@ async function save(){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({start:(g('f-start')||{}).value||'',
                          end:(g('f-end')||{}).value||'',
-                         normalise:g('norm').checked})});
+                         normalise:g('norm').checked,
+                         pauses:g('pauses').checked,
+                         stutters:g('stutters').checked})});
 }
-g('norm').addEventListener('change',save);
+['norm','pauses','stutters'].forEach(id=>{
+  const e=g(id); if(e) e.addEventListener('change',save); });
 
 /* ---------- cuts from the middle ---------- */
 function cutRows(){ return [...document.querySelectorAll('#cuts .cut')]; }
@@ -994,6 +1206,34 @@ async function build(){
 def esc(s):
     return (str(s if s is not None else "").replace("&", "&amp;")
             .replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def stutter_note(st):
+    """Whether repeated-word removal can run at all, said before it's ticked.
+
+    It needs per-word timings, which only a Rev.ai JSON carries here. A Zoom
+    .txt has one timestamp per speaker turn — you can hear the stutter in the
+    audio, but nothing in the file says where the second "I" ends. Better to
+    say that next to the checkbox than to tick it and silently do nothing.
+    """
+    if st.get("word_times"):
+        n = st.get("word_count") or 0
+        return ("Ready &mdash; <b>%s</b> has per-word timings for %s words. "
+                "Keeps the last attempt, which is the one that carries on into "
+                "the sentence. Words people double on purpose &mdash; "
+                "&ldquo;no, no, no&rdquo; &mdash; are left alone."
+                % (esc(st.get("transcript_name") or "your transcript"),
+                   "{:,}".format(n)))
+    if st.get("transcript_name"):
+        return ("Your transcript, <b>%s</b>, only has a time per speaker turn, "
+                "so there is nothing to cut against. This needs a "
+                "<b>Rev.ai .json</b>, which times every word. Ticking this "
+                "without one does nothing and the build will say so."
+                % esc(st["transcript_name"]))
+    return ("Needs a transcript with per-word timings &mdash; a <b>Rev.ai "
+            ".json</b>. Add one under <i>Find the retakes for me</i> above. "
+            "A Zoom .txt won't do: it has one time per speaker turn, so "
+            "there's no way to know where a repeated word ends.")
 
 
 def cut_row(i, c):
@@ -1222,6 +1462,9 @@ def render():
             .replace("__BUILDSTEP__", build_step)
             .replace("__MUSICROWS__", "".join(rows))
             .replace("__NORM__", "checked" if st.get("normalise", True) else "")
+            .replace("__PAUSES__", "checked" if st.get("remove_pauses") else "")
+            .replace("__STUTTERS__", "checked" if st.get("remove_stutters") else "")
+            .replace("__STUTTERNOTE__", stutter_note(st))
             .replace("__CANBUILD__", "" if (rec and ok_ffmpeg) else "disabled")
             .replace("__RESULT__", result)
             .replace("PCT", chr(37)))
@@ -1401,7 +1644,9 @@ class H(http.server.BaseHTTPRequestHandler):
                 if err:
                     return self.json({"ok": False, "error": err}, 400)
                 write_state({"start": "", "end": "", "normalise": True,
-                             "cuts": [], "retakes": None})
+                             "cuts": [], "retakes": None,
+                             "remove_pauses": False,
+                             "remove_stutters": False})
                 return self.json({"ok": True, "name": name, "bytes": got})
 
             m = re.match(r"^/api/music/(intro|outro)$", p)
@@ -1443,11 +1688,25 @@ class H(http.server.BaseHTTPRequestHandler):
                                       "that doesn't look like a text transcript "
                                       "— a .txt, .vtt, .srt or Rev.ai .json "
                                       "works"}, 400)
+                # Kept, not just scanned. Retakes only need the words, but
+                # cutting stutters needs the per-word times, and those only
+                # exist while the file is still here.
+                os.makedirs(WORK, exist_ok=True)
+                saved = "_transcript" + (os.path.splitext(name)[1] or ".txt")
+                with open(os.path.join(WORK, saved), "w", encoding="utf-8") as f:
+                    f.write(text)
+
                 st = read_state()
                 st["transcript_name"] = name
                 st["retakes"] = find_retakes(text)
+                words = load_word_times(os.path.join(WORK, saved))
+                st["word_times"] = saved if words else ""
+                st["word_count"] = len(words)
+                if not words:
+                    st["remove_stutters"] = False
                 write_state(st)
-                return self.json({"ok": True, "found": len(st["retakes"])})
+                return self.json({"ok": True, "found": len(st["retakes"]),
+                                  "words": len(words)})
 
             body = {}
             if n:
@@ -1483,6 +1742,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 st["start"] = str(body.get("start") or "").strip()
                 st["end"] = str(body.get("end") or "").strip()
                 st["normalise"] = bool(body.get("normalise", True))
+                st["remove_pauses"] = bool(body.get("pauses"))
+                st["remove_stutters"] = bool(body.get("stutters"))
                 write_state(st)
                 return self.json({"ok": True})
 
